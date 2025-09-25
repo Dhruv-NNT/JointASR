@@ -452,35 +452,140 @@ def main():
     # -----------------------------
     # Train Loop
     # -----------------------------
+    # for epoch in range(start_epoch, cfg.training.epochs + 1):
+    #     # Epoch-wise CTC weight
+    #     ctc_w = compute_ctc_weight(epoch, cfg.training.epochs, cfg.training)
+    #     if writer:
+    #         writer.add_scalar("ctc_weight/epoch", ctc_w, epoch)
+
+    #     # Train
+    #     model.train()
+    #     epoch_loss, epoch_ctc, epoch_attn = 0.0, 0.0, 0.0
+
+    #     for batch in train_loader:
+    #         batch = maybe_hf_to_features(batch, hf_extractor, cfg.training.device)
+    #         stats = trainer.train_step(batch, ctc_w)
+    #         epoch_loss += stats["total"]
+    #         epoch_ctc  += stats["ctc"]
+    #         epoch_attn += stats["attn"]
+
+    #     n_steps = max(1, len(train_loader))
+    #     tr_loss = epoch_loss / n_steps
+    #     tr_ctc  = epoch_ctc  / n_steps
+    #     tr_attn = epoch_attn / n_steps
+
+    #     # Validate (compute loss + optional WER sample)
+    #     val_loss, val_ctc, val_attn = 0.0, 0.0, 0.0
+    #     model.eval()
+    #     with torch.no_grad():
+    #         for batch in val_loader:
+    #             batch = maybe_hf_to_features(batch, hf_extractor, cfg.training.device)
+    #             # Forward for loss
+    #             X, x_len, Y_attn, y_attn_len, Y_ctc, y_ctc_len = batch
+    #             X = X.to(cfg.training.device); x_len = x_len.to(cfg.training.device)
+    #             Y_attn = Y_attn.to(cfg.training.device); Y_ctc = Y_ctc.to(cfg.training.device)
+    #             ys_in = Y_attn[:, :-1]
+    #             outputs = model(X, x_len, ys_in)
+    #             targets = (Y_attn, y_attn_len, Y_ctc, y_ctc_len)
+    #             loss, parts = loss_comp.compute(outputs, targets, ctc_w)
+    #             val_loss += float(loss.item()); val_ctc += parts["ctc"]; val_attn += parts["attn"]
+
+    #     n_val = max(1, len(val_loader))
+    #     val_loss /= n_val; val_ctc /= n_val; val_attn /= n_val
+
+    #     # Log epoch aggregates
+    #     if writer:
+    #         writer.add_scalar("train_epoch/loss", tr_loss, epoch)
+    #         writer.add_scalar("train_epoch/ctc_loss", tr_ctc, epoch)
+    #         writer.add_scalar("train_epoch/attn_loss", tr_attn, epoch)
+    #         writer.add_scalar("val/loss", val_loss, epoch)
+    #         writer.add_scalar("val/ctc_loss", val_ctc, epoch)
+    #         writer.add_scalar("val/attn_loss", val_attn, epoch)
+
+    #     print(f"[{epoch}] ctc_weight={ctc_w:.3f}")
+    #     print(f"[{epoch}] train loss={tr_loss:.4f} ctc={tr_ctc:.4f} attn={tr_attn:.4f} | "
+    #           f"val loss={val_loss:.4f} ctc={val_ctc:.4f} attn={val_attn:.4f}")
+
+    #     # Save checkpoints
+    #     if val_loss < best_val:
+    #         best_val = val_loss
+    #         save_checkpoint(os.path.join(cfg.data.save_dir, "best.pt"),
+    #                         model, optimizer, scheduler, epoch, best_val, trainer.global_step, run_dir, cfg)
+    #     # epoch & last
+    #     save_checkpoint(ckpt_path_epoch(cfg.data.save_dir, epoch),
+    #                     model, optimizer, scheduler, epoch, best_val, trainer.global_step, run_dir, cfg)
+    #     save_checkpoint(os.path.join(cfg.data.save_dir, "last.pt"),
+    #                     model, optimizer, scheduler, epoch, best_val, trainer.global_step, run_dir, cfg)
+
+    #     # (Optional) Quick WER probe every 10 epochs
+    #     # --- Reference-style: every 10 epochs, compute batch WER (CTC & Attn) on ONE random batch ---
+    #     # --- before the epoch loop (already present) ---
     for epoch in range(start_epoch, cfg.training.epochs + 1):
-        # Epoch-wise CTC weight
+        # epoch-wise CTC weight
         ctc_w = compute_ctc_weight(epoch, cfg.training.epochs, cfg.training)
         if writer:
             writer.add_scalar("ctc_weight/epoch", ctc_w, epoch)
 
-        # Train
         model.train()
-        epoch_loss, epoch_ctc, epoch_attn = 0.0, 0.0, 0.0
+        epoch_loss = epoch_ctc = epoch_attn = 0.0
 
-        for batch in train_loader:
+        # WER sampling setup — deterministic per epoch
+        do_print = (epoch % 10 == 0)
+        steps_per_epoch = len(train_loader)
+        rng_state = random.getstate()
+        random.seed(epoch)  # deterministic batch pick for reproducibility
+        print_batch_idx = random.randint(1, steps_per_epoch) if do_print else None
+        random.setstate(rng_state)
+
+        for batch_idx, batch in enumerate(train_loader, 1):
+            # (hf conversion if needed)
             batch = maybe_hf_to_features(batch, hf_extractor, cfg.training.device)
-            stats = trainer.train_step(batch, ctc_w)
-            epoch_loss += stats["total"]
-            epoch_ctc  += stats["ctc"]
-            epoch_attn += stats["attn"]
 
+            # ---- normal training step
+            stats = trainer.train_step(batch, ctc_w)
+            epoch_loss += stats["total"]; epoch_ctc += stats["ctc"]; epoch_attn += stats["attn"]
+
+            # ---- one-time train-batch WER probe (side-effect free)
+            if do_print and batch_idx == print_batch_idx:
+                try:
+                    # clone lightweight views for safety; keep labels on CPU
+                    X, x_len, Y_attn, y_attn_len, Y_ctc, y_ctc_len = batch
+                    X_wer    = X.detach().clone()
+                    xlen_wer = x_len.detach().clone()
+
+                    model_for_eval = model.module if isinstance(model, torch.nn.DataParallel) else model
+                    wer_ctc, wer_attn, sample = batch_wer_and_one_sample(
+                        model_for_eval,
+                        (X_wer, xlen_wer, Y_attn, y_attn_len, Y_ctc, y_ctc_len),
+                        tokenizer,
+                        device=cfg.training.device,
+                        max_len=128
+                    )
+                    print(f"[E{epoch:02d} B{batch_idx:04d}] Batch WER — CTC: {wer_ctc*100:.2f}% | Attn: {wer_attn*100:.2f}%")
+                    print("   ├─ REF :", sample['ref'])
+                    print("   ├─ CTC :", sample['ctc'])
+                    print("   └─ ATTN:", sample['attn'])
+                    if writer:
+                        writer.add_scalar("train/batch_wer_ctc",  wer_ctc,  trainer.global_step)
+                        writer.add_scalar("train/batch_wer_attn", wer_attn, trainer.global_step)
+                        writer.add_text("train/sample",
+                                        f"REF: {sample['ref']}\nCTC: {sample['ctc']}\nATTN:{sample['attn']}",
+                                        trainer.global_step)
+                except Exception as e:
+                    print(f"[warn] train-batch WER probe failed: {e}")
+
+        # ===== keep the end-of-epoch summary & validation just like before =====
         n_steps = max(1, len(train_loader))
         tr_loss = epoch_loss / n_steps
         tr_ctc  = epoch_ctc  / n_steps
         tr_attn = epoch_attn / n_steps
 
-        # Validate (compute loss + optional WER sample)
+        # --- validation (unchanged)
         val_loss, val_ctc, val_attn = 0.0, 0.0, 0.0
         model.eval()
         with torch.no_grad():
             for batch in val_loader:
                 batch = maybe_hf_to_features(batch, hf_extractor, cfg.training.device)
-                # Forward for loss
                 X, x_len, Y_attn, y_attn_len, Y_ctc, y_ctc_len = batch
                 X = X.to(cfg.training.device); x_len = x_len.to(cfg.training.device)
                 Y_attn = Y_attn.to(cfg.training.device); Y_ctc = Y_ctc.to(cfg.training.device)
@@ -493,7 +598,6 @@ def main():
         n_val = max(1, len(val_loader))
         val_loss /= n_val; val_ctc /= n_val; val_attn /= n_val
 
-        # Log epoch aggregates
         if writer:
             writer.add_scalar("train_epoch/loss", tr_loss, epoch)
             writer.add_scalar("train_epoch/ctc_loss", tr_ctc, epoch)
@@ -504,7 +608,7 @@ def main():
 
         print(f"[{epoch}] ctc_weight={ctc_w:.3f}")
         print(f"[{epoch}] train loss={tr_loss:.4f} ctc={tr_ctc:.4f} attn={tr_attn:.4f} | "
-              f"val loss={val_loss:.4f} ctc={val_ctc:.4f} attn={val_attn:.4f}")
+            f"val loss={val_loss:.4f} ctc={val_ctc:.4f} attn={val_attn:.4f}")
 
         # Save checkpoints
         if val_loss < best_val:
@@ -519,31 +623,7 @@ def main():
 
         # (Optional) Quick WER probe every 10 epochs
         # --- Reference-style: every 10 epochs, compute batch WER (CTC & Attn) on ONE random batch ---
-        if epoch % 10 == 0:
-            try:
-                import random
-                rand_idx = random.randrange(len(val_loader))
-                for bi, batch in enumerate(val_loader):
-                    if bi == rand_idx:
-                        batch = maybe_hf_to_features(batch, hf_extractor, cfg.training.device)
-                        wer_ctc, wer_attn, sample = batch_wer_and_one_sample(
-                            model.module if isinstance(model, torch.nn.DataParallel) else model,
-                            batch, tokenizer, device=cfg.training.device, max_len=128
-                        )
-                        print(f"[E{epoch:02d}] Batch WER — CTC: {wer_ctc*100:.2f}% | Attn: {wer_attn*100:.2f}%")
-                        print("   ├─ REF :", sample['ref'])
-                        print("   ├─ CTC :", sample['ctc'])
-                        print("   └─ ATTN:", sample['attn'])
-                        if writer:
-                            writer.add_scalar("train/batch_wer_ctc",  wer_ctc,  epoch)
-                            writer.add_scalar("train/batch_wer_attn", wer_attn, epoch)
-                        break
-            except Exception as e:
-                print(f"[warn] batch WER probe failed: {e}")
-
-
-    if writer:
-        writer.close()
+        # --- before the epoch loop (already present) ---
 
 
 if __name__ == "__main__":

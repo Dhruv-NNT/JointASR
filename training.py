@@ -76,7 +76,7 @@ def compute_ctc_weight(
     start = config.ctc_weight
     end = config.ctc_weight_end
     hold = config.ctc_hold_epochs
-    kind = (config.ctc_weight_kind or "cosine").lower()
+    kind = (config.ctc_weight_kind or "linear").lower()
 
     if epoch <= hold:
         return float(start)
