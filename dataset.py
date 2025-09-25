@@ -12,6 +12,42 @@ from config import Config, MelConfig, HFRobustConfig
 from tokenizer import CharTokenizer
 from features import LogMelSpec
 
+
+def resolve_feature_root(root: str) -> str:
+    """Resolve feature root to the exact folder layout used in the reference script."""
+    root = (root or "").strip()
+    if not root:
+        return "features/robust-ft"
+
+    root = root.rstrip("/")
+    if os.path.isabs(root):
+        return root
+    if root.startswith("features/"):
+        return root
+    return f"features/{root}"
+
+
+def audio_to_feature_path(audio_path: str, feature_root: str, layer: str) -> str:
+    """Replicate the reference robust-ft mapping rules exactly."""
+
+    resolved_root = resolve_feature_root(feature_root)
+    layer = str(layer)
+
+    feat_path = (
+        audio_path
+        .replace("audios", f"{resolved_root}/{layer}")
+        .replace("wav/arctic_", "")
+        .replace(".wav", ".npy")
+    )
+
+    if not os.path.isfile(feat_path):
+        raise FileNotFoundError(
+            f"Feature file not found: {feat_path} (from audio='{audio_path}', "
+            f"feature_root='{feature_root}', layer='{layer}')"
+        )
+
+    return feat_path
+
 class ASRDataset(Dataset):
     """ASR dataset for training and validation."""
     
@@ -85,9 +121,13 @@ class ASRDataset(Dataset):
             return (wav.to(torch.float32).contiguous(), int(sr))
         else:
             # Load precomputed features from disk
-            feat_path = self._audio_to_feature_path(audio_path)
+            feat_path = audio_to_feature_path(
+                audio_path,
+                self.config.feature_root,
+                self.config.robust_layer,
+            )
             arr = np.load(feat_path)
-            
+
             # Validate and transpose if needed
             if arr.ndim != 2:
                 raise ValueError(f"Expected 2D features, got {arr.shape}")
@@ -113,27 +153,6 @@ class ASRDataset(Dataset):
         # Extract mel features
         mel_spec = self.mel_extractor(wav).squeeze(0)  # [n_mels, T]
         return mel_spec.transpose(0, 1).contiguous().to(torch.float32)  # [T, n_mels]
-
-    def _audio_to_feature_path(self, audio_path: str) -> str:
-        root = self.config.feature_root
-        # Ensure we include 'features/' exactly once to mirror original code
-        if not root.startswith("features/"):
-            root = f"features/{root}"
-
-        layer = str(self.config.robust_layer)
-        feat_path = (
-            audio_path
-            .replace("audios", f"{root}/{layer}")
-            .replace("wav/arctic_", "")
-            .replace(".wav", ".npy")
-        )
-        if not os.path.isfile(feat_path):
-            raise FileNotFoundError(
-                f"Feature file not found: {feat_path} "
-                f"(from audio='{audio_path}', feature_root='{self.config.feature_root}', layer='{layer}')"
-            )
-        return feat_path
-
 
 def collate_fn(batch):
     """

@@ -82,17 +82,22 @@ class Config:
     # Feature mode settings
     feature_mode: Literal["mel", "robust"] = "mel"
     robust_source: Literal["disk", "hf"] = "disk"
-    feature_root: Literal["robust-ft", "xls-r-300m", "xlsr300m-ft"] = "xls-r-300m"
+    feature_root: str = "xls-r-300m"
     robust_layer: str = "24"
     
     def update_for_mode(self):
         """Update configuration based on feature mode."""
         if self.feature_mode == "robust":
+            # Mirror the reference script defaults for robust features
             self.model.input_dim = 1024
-            if self.robust_source == "disk":
-                self.model.sub1_channels = 512
-                self.model.stride2 = 1
+            self.model.sub1_channels = 512
+            self.model.sub2_channels = 512
+            self.model.stride1 = 2
+            self.model.stride2 = 1
         else:
+            # Log-mel configuration matches the reference behaviour
             self.model.input_dim = 80
             self.model.sub1_channels = 256
+            self.model.sub2_channels = 512
+            self.model.stride1 = 2
             self.model.stride2 = 2

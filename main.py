@@ -33,7 +33,12 @@ from config import (
     MelConfig, HFRobustConfig
 )
 from tokenizer import CharTokenizer, build_tokenizer
-from dataset import ASRDataset, collate_fn
+from dataset import (
+    ASRDataset,
+    collate_fn,
+    audio_to_feature_path,
+    resolve_feature_root,
+)
 from features import HFRobustExtractor
 from model import JointASR
 from training import (
@@ -54,7 +59,7 @@ def banner(msg: str):
     print("=" * 80 + "\n")
 
 def verify_feature_mapping(cfg):
-    import pandas as pd, os
+    import pandas as pd
     try:
         df = pd.read_csv(cfg.data.csv_path)
         if len(df) == 0:
@@ -62,16 +67,7 @@ def verify_feature_mapping(cfg):
             return
         raw = df.iloc[0]["audio_filename"]
 
-        root = cfg.feature_root
-        if not root.startswith("features/"):
-            root = f"features/{root}"
-        feat = (
-            raw
-            .replace("audios", f"{root}/{cfg.robust_layer}")
-            .replace("wav/arctic_", "")
-            .replace(".wav", ".npy")
-        )
-
+        feat = audio_to_feature_path(raw, cfg.feature_root, cfg.robust_layer)
         exists = os.path.isfile(feat)
         print("[verify] Raw audio:", raw)
         print("[verify] Mapped feature:", feat)
@@ -125,7 +121,7 @@ def save_checkpoint(
 
     payload = {
     # save the real module weights if DataParallel is used
-    "model": model.state_dict() if not isinstance(model, torch.nn.DataParallel) else model.module.state_dict(),
+    "model": model.state_dict() if not isinstance(model, nn.DataParallel) else model.module.state_dict(),
     "optimizer": optimizer.state_dict(),
 
     # keep your existing scheduler state
@@ -171,7 +167,8 @@ def load_checkpoint(
     device: str
 ) -> Tuple[int, float, int, str]:
     ckpt = torch.load(path, map_location=device)
-    model.load_state_dict(ckpt["model"], strict=True)
+    target_model = model.module if isinstance(model, nn.DataParallel) else model
+    target_model.load_state_dict(ckpt["model"], strict=True)
     optimizer.load_state_dict(ckpt["optimizer"])
     if "scheduler" in ckpt:
         scheduler.load_state_dict(ckpt["scheduler"])
@@ -234,8 +231,12 @@ def build_argparser():
     # Feature mode
     p.add_argument("--feature_mode", choices=["mel", "robust"], default="mel")
     p.add_argument("--robust_source", choices=["disk", "hf"], default="disk")
-    # Feature mode
-    p.add_argument("--feature_root", choices=["robust-ft", "xls-r-300m", "xlsr300m-ft"], default="xls-r-300m", help="Name of the robust feature family folder")
+    p.add_argument(
+        "--feature_root",
+        type=str,
+        default="xls-r-300m",
+        help="Feature root (e.g. 'features/robust-ft', 'robust-ft', or an absolute path)",
+    )
     p.add_argument("--robust_layer", type=str, default="24")
 
     # Mel config overrides
@@ -251,6 +252,11 @@ def build_argparser():
     p.add_argument("--resume", action="store_true")
     p.add_argument("--resume_path", type=str, default="")
     p.add_argument("--gpus", type=str, default=None, help="CUDA_VISIBLE_DEVICES string, e.g. '5' or '5,6'")
+    p.add_argument(
+        "--data_parallel",
+        action="store_true",
+        help="Enable nn.DataParallel (disabled by default to mirror the reference script)",
+    )
     return p
 
 
@@ -294,6 +300,9 @@ def main():
         robust_layer=args.robust_layer,
     )
     cfg.update_for_mode()
+
+    if cfg.feature_mode == "robust":
+        cfg.feature_root = resolve_feature_root(cfg.feature_root)
 
     # Banner
     if cfg.feature_mode == "robust":
@@ -390,10 +399,15 @@ def main():
     model = JointASR(cfg.model, tokenizer.vocab_size, tokenizer.pad_id, tokenizer.sos_id, tokenizer.eos_id)
     model = model.to(cfg.training.device)
 
-    # --- Multi-GPU (DataParallel) like requested ---
-    if torch.cuda.is_available() and torch.cuda.device_count() > 1 and cfg.training.device.startswith("cuda"):
+    # Optional DataParallel to match the reference behaviour (off by default)
+    if (
+        args.data_parallel
+        and torch.cuda.is_available()
+        and torch.cuda.device_count() > 1
+        and cfg.training.device.startswith("cuda")
+    ):
         print(f"[GPU] Using DataParallel over {torch.cuda.device_count()} visible GPUs")
-        model = nn.DataParallel(model)  # scatters to all visible GPUs
+        model = nn.DataParallel(model)
 
     # Optimizer + Scheduler
     optimizer = optim.Adam(model.parameters(), lr=cfg.training.peak_lr, betas=(0.9, 0.98), eps=1e-9)
@@ -442,12 +456,14 @@ def main():
         run_dir = os.path.join(tb_root, time.strftime("%Y%m%d-%H%M%S"))
     writer = SummaryWriter(log_dir=run_dir, purge_step=global_step)
     trainer.writer = writer  # attach for logging
+    trainer.global_step = global_step
 
     # Evaluator for WER (optional)
     evaluator = Evaluator(model, tokenizer, device=cfg.training.device)
 
     print(f"TensorBoard logdir: {run_dir}")
     print(f"warmup {cfg.training.warmup_steps} steps to LR {cfg.training.peak_lr} over {cfg.training.epochs} epochs ({steps_per_epoch} steps/epoch)")
+    print("Using warmup+cosine LR schedule.")
 
     # -----------------------------
     # Train Loop
@@ -527,7 +543,7 @@ def main():
                     if bi == rand_idx:
                         batch = maybe_hf_to_features(batch, hf_extractor, cfg.training.device)
                         wer_ctc, wer_attn, sample = batch_wer_and_one_sample(
-                            model.module if isinstance(model, torch.nn.DataParallel) else model,
+                            model.module if isinstance(model, nn.DataParallel) else model,
                             batch, tokenizer, device=cfg.training.device, max_len=128
                         )
                         print(f"[E{epoch:02d}] Batch WER — CTC: {wer_ctc*100:.2f}% | Attn: {wer_attn*100:.2f}%")
