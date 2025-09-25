@@ -89,10 +89,13 @@ class Config:
         """Update configuration based on feature mode."""
         if self.feature_mode == "robust":
             self.model.input_dim = 1024
-            if self.robust_source == "disk":
-                self.model.sub1_channels = 512
-                self.model.stride2 = 1
+            self.model.stride1 = 2
+            self.model.sub1_channels = 512
+            self.model.stride2 = 1
+            self.model.sub2_channels = 512
         else:
             self.model.input_dim = 80
+            self.model.stride1 = 2
             self.model.sub1_channels = 256
+            self.model.sub2_channels = 512
             self.model.stride2 = 2
